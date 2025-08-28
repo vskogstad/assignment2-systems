@@ -5,7 +5,7 @@ from benchmark import benchmark_model
 from cs336_basics.config import Config
 from tabulate import tabulate
 
-experiments = ["small", "medium", "large", "xl", "2.7B"]
+experiments = ["small", "medium", "large", "xl"] # "2.7B"]
 base_cfg = "cs336_systems/base.yaml"
 
 
@@ -32,15 +32,12 @@ def run_benchmark(config_file, experiment_name):
     config = Config.from_yaml(config_file)
     for key, value in get_specs(experiment_name).items():
         setattr(config, key, value)
-    cmd = ["uv", "run", "cs336_systems/benchmark.py", "--config", config_file]
-    print(config)
     # [cmd.extend(modification) for modification in modifications]
 
     print(f"Starting benchmark: {experiment_name}")
     print("-" * 50)
-    print(cmd)
 
-    result = benchmark_model(config, loss_func=None, num_trials=10, warmup_steps=5, backward=True)
+    result = benchmark_model(config, memory_profile=False, num_trials=10, warmup_steps=2, backward=True)
     print(f"Completed: {experiment_name}")
 
     # print(f"{result = }")
@@ -48,7 +45,7 @@ def run_benchmark(config_file, experiment_name):
 
 
 def print_results(table):
-    print(table)
+    #print(table)
     print(
         tabulate(
             table,
@@ -60,7 +57,7 @@ def print_results(table):
 
 def main():
     print(f"Running {len(experiments)} experiments")
-    experimental_results = {}
+    experimental_results = []
 
     for i, experiment_name in enumerate(experiments):
         print(f"\n[{i}/{len(experiments)}] Running experiment...")
@@ -70,7 +67,7 @@ def main():
         if not success:
             print(f"\nStopping due to failed experiment: {experiment_name}")
             sys.exit()
-        experimental_results[experiment_name] = success
+        experimental_results.append([experiment_name, *success])
 
     print("\n All experiments completed.")
     print_results(experimental_results)
