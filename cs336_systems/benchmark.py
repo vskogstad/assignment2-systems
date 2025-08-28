@@ -10,7 +10,7 @@ from cs336_basics.train_model import get_model
 from einops import rearrange
 
 
-def benchmark_model(cfg: Config, loss_func, num_trials: int, warmup_steps: int, backward: bool):
+def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_steps: int, backward: bool):
     """
     Not sure how to do the warmup separately without a lot of code repetition.
     So I just do everything together and delete data for warmup steps afterwards.
@@ -27,9 +27,12 @@ def benchmark_model(cfg: Config, loss_func, num_trials: int, warmup_steps: int, 
     backward_timings: list[float] = []
     results = []
 
-    for trial in range(warmup_steps + num_trials):  # Do warmup with timing, discard data afterwards
+    for trial in range(warmup_steps + num_trials): 
         # Training loop
-        start_time = timeit.default_timer()
+        if memory_profile and trial == warmup_steps:
+            # Start recording memory history.
+            torch.cuda.memory._record_memory_history(max_entries=1000000)
+        start_time = timeit.default_timer()   # Do warmup with timing, discard data afterwards
         x = torch.randint(high=cfg.vocab_size, size=(cfg.d_model, cfg.batch_size), device=device)
         y = torch.randint(high=cfg.vocab_size, size=(cfg.d_model, cfg.batch_size), device=device)
 
@@ -53,10 +56,13 @@ def benchmark_model(cfg: Config, loss_func, num_trials: int, warmup_steps: int, 
 
         forward_time = end_forward - start_time
         timings.append(forward_time)
-    # print("Before ")
-    # print(timings)
+
+    if memory_profile:
+        # Save a pickle file to be loaded by PyTorch's online tool.
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None) # Stop recording history.
+    # Remove timings for warmup-steps
     timings = timings[warmup_steps:]
-    # print(timings)
     results.extend([np.mean(timings), np.std(timings)])
 
     print(
