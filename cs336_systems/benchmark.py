@@ -4,11 +4,32 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 import torch
+import torch.cuda.nvtx as nvtx
 from cs336_basics.config import Config, get_parser
-from cs336_basics.model import Transformer
+from cs336_basics.model import Transformer, scaled_dot_product_attention
+#cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
 from cs336_basics.train_model import get_model
 from einops import rearrange
 
+
+@torch.compile()
+def annotated_scaled_dot_product_attention(Q, K, V, mask):
+    d_k = Q.shape[-1]
+    seq_len = Q.shape[-2]
+    # print(f"{Q.shape=}  {K.shape=} | {V.shape=}")
+    # Q^T K / sqrt(d_k)
+    with nvtx.range("computing attention scores"):
+        attn = einsum(Q, K, "b ... sq d_k, b ... sk d_k -> b ... sq sk") / math.sqrt(d_k)
+    
+    # apply mask if included
+    if mask is not None:
+        attn = attn.masked_fill(mask[:seq_len, :seq_len] == False, float("-inf"))
+    with nvtx.range("computing softmax"):    
+        result = einsum(softmax(x=attn, dimension=-1), V, "b ... sq sk, b ... sk d_v -> b ... sq d_v")
+
+    return result
+scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_steps: int, backward: bool):
     """
@@ -18,6 +39,7 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
     Using deafult loss now, should probably load it separately
 
     """
+    
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     cfg.dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float32
 
