@@ -1,19 +1,18 @@
 import timeit
 from typing import Callable
-
+import math
 import numpy as np
 import pandas as pd
 import torch
 import torch.cuda.nvtx as nvtx
 from cs336_basics.config import Config, get_parser
-from cs336_basics.model import Transformer, scaled_dot_product_attention
-#cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+from cs336_basics.model import Transformer
 
-from cs336_basics.train_model import get_model
-from einops import rearrange
+from cs336_basics.train_model import get_model, softmax
+from einops import einsum, rearrange
 
 
-@torch.compile()
+
 def annotated_scaled_dot_product_attention(Q, K, V, mask):
     d_k = Q.shape[-1]
     seq_len = Q.shape[-2]
@@ -29,7 +28,9 @@ def annotated_scaled_dot_product_attention(Q, K, V, mask):
         result = einsum(softmax(x=attn, dimension=-1), V, "b ... sq sk, b ... sk d_v -> b ... sq d_v")
 
     return result
-scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
+import cs336_basics.model
+cs336_basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
 
 def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_steps: int, backward: bool):
     """
@@ -43,7 +44,8 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     cfg.dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float32
 
-    model = get_model(cfg, device) if device == torch.device("cpu") else torch.compile(get_model(cfg, device))
+    with nvtx.range("loading model"):
+        model = get_model(cfg, device) if device == torch.device("cpu") else torch.compile(get_model(cfg, device))
 
     timings: list[float] = []
     backward_timings: list[float] = []
@@ -51,6 +53,7 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
 
     for trial in range(warmup_steps + num_trials): 
         # Training loop
+        nvtx.range_push(f"push step {trial}")
         if memory_profile and trial == warmup_steps:
             # Start recording memory history.
             torch.cuda.memory._record_memory_history(max_entries=1000000)
@@ -78,6 +81,8 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
 
         forward_time = end_forward - start_time
         timings.append(forward_time)
+        nvtx.range_pop()
+
 
     if memory_profile:
         # Save a pickle file to be loaded by PyTorch's online tool.
