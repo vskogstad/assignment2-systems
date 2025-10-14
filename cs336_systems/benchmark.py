@@ -45,7 +45,7 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
     cfg.dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float32
 
     with nvtx.range("loading model"):
-        model = get_model(cfg, device) if device == torch.device("cpu") else torch.compile(get_model(cfg, device))
+        model = get_model(cfg, device) if (device == torch.device("cpu") or not cfg.compile) else torch.compile(get_model(cfg, device))
 
     timings: list[float] = []
     backward_timings: list[float] = []
@@ -53,7 +53,7 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
 
     for trial in range(warmup_steps + num_trials): 
         # Training loop
-        nvtx.range_push(f"push step {trial}")
+        nvtx.range_push(f"step {trial} forward")
         if memory_profile and trial == warmup_steps:
             # Start recording memory history.
             torch.cuda.memory._record_memory_history(max_entries=1000000)
@@ -66,8 +66,10 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         end_forward = timeit.default_timer()
+        nvtx.range_pop()
         # loss = cross_entropy(pred=y_pred, targets=y)
         if backward:
+            nvtx.range_push(f"step {trial} backward")
             # Trying to search for nan-source using regular cross entropy
             import torch.nn.functional as F
 
@@ -78,10 +80,10 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
             end_backward = timeit.default_timer()
             backward_time = end_backward - end_forward
             backward_timings.append(backward_time)
-
+            nvtx.range_pop()
         forward_time = end_forward - start_time
         timings.append(forward_time)
-        nvtx.range_pop()
+        
 
 
     if memory_profile:

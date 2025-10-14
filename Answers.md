@@ -45,7 +45,7 @@ With 1 warmup step:
 | xl                |      0.597181  |   0.00171275  |       1.17032   |    7.78347e-05 |
 +-------------------+----------------+---------------+-----------------+----------------+
 
-With 2 warmup steps we basically have the same time and std as with 5. It is not clear to me why we need more than 1 step however.
+With 2 warmup steps we basically have the same time and std as with 5. According to torch.compile manual we need 2 warmup steps for CUDA graphs.
 +-------------------+----------------+---------------+-----------------+----------------+
 | Experiment_name   |   Forward time |   Forward std |   backward time |   backward std |
 +===================+================+===============+=================+================+
@@ -58,8 +58,9 @@ With 2 warmup steps we basically have the same time and std as with 5. It is not
 | xl                |      0.596489  |   0.000230396 |       1.17028   |    1.83074e-05 |
 +-------------------+----------------+---------------+-----------------+----------------+
 
-
-With profiling nsys:
+Nsys_profile:
+a)
+With profiling nsys we see that we spend fomr 3x to 1.2x longer in the forward pass. The change is smaller for bigger models. Backward pass is unchanged.
 +-------------------+----------------+---------------+-----------------+----------------+
 | Experiment_name   |   Forward time |   Forward std |   backward time |   backward std |
 +===================+================+===============+=================+================+
@@ -71,4 +72,22 @@ With profiling nsys:
 +-------------------+----------------+---------------+-----------------+----------------+
 | xl                |      0.762566  |    0.0026405  |        1.1778   |    0.000947067 |
 +-------------------+----------------+---------------+-----------------+----------------+
-The target application terminated. One or more process it created re-parented.
+
+b) 
+Found that I had used torch.compile for everything so far. I have adjusted that now, and also made changes to my model which will affect timings. This is the new standard time used.
+
+c)
+
+d)
+
+e)
+
+
+Mixed precision:
+
+The resulting tensors are:
+tensor(10.0001)                         -> Pure float32, expecting high accuracy
+tensor(9.9531, dtype=torch.float16)     -> Pure float16. Lower precision -> missing target over time.
+tensor(10.0021)                         -> Small number in float16. Accumulate result in float32.
+tensor(10.0021)                         -> Shows that adding a float16 value to float32 accumulator is the same as explicitly casting float16 to float32 and adding.
+
