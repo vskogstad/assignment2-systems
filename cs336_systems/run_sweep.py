@@ -30,8 +30,10 @@ def run_benchmark(config_file, experiment_name):
     # modifications = [["--" + k, v] for k, v in get_specs(experiment_name).items()]
     # print(modifications)
     config = Config.from_yaml(config_file)
-    for key, value in get_specs(experiment_name).items():
-        setattr(config, key, value)
+    for context_length in [128, 256, 512, 1024]:
+        setattr(config, "context_length", context_length)
+        for key, value in get_specs(experiment_name).items():
+            setattr(config, key, value)
     # [cmd.extend(modification) for modification in modifications]
 
     print(f"Starting benchmark: {experiment_name}")

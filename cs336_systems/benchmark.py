@@ -8,9 +8,8 @@ import torch.cuda.nvtx as nvtx
 from cs336_basics.config import Config, get_parser
 from cs336_basics.model import Transformer
 
-from cs336_basics.train_model import get_model, softmax
+from cs336_basics.train_model import get_model, softmax, get_optimizer
 from einops import einsum, rearrange
-
 
 
 def annotated_scaled_dot_product_attention(Q, K, V, mask):
@@ -45,7 +44,11 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
     cfg.dtype = torch.bfloat16 if cfg.dtype == "bfloat16" else torch.float32
 
     with nvtx.range("loading model"):
-        model = get_model(cfg, device) if (device == torch.device("cpu") or not cfg.compile) else torch.compile(get_model(cfg, device))
+        model = get_model(cfg, device) if (device == torch.device("cpu") or not cfg.compile_model) else torch.compile(get_model(cfg, device))
+
+    with nvtx.range("loading optimizer"):
+        pass
+        #optimizer = get_optimizer(cfg=cfg, model=model)
 
     timings: list[float] = []
     backward_timings: list[float] = []
