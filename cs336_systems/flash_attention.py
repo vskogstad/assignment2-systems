@@ -80,14 +80,23 @@ def flash_fwd_kernel(
     l_j = tl.full((Q_TILE_SIZE,), 1, dtype=tl.float32)
     o_j = tl.full((Q_TILE_SIZE, D), 1, dtype=tl.float32)
     q = tl.load(Q_block_ptr, boundary_check = (0,1), padding_option="zero")
-
-    for j in range(N_KEYS//K_TILE_SIZE):
+    num_k_tiles = query_tile_index + 1 if is_causal else N_KEYS//K_TILE_SIZE
+    
+    for j in range(num_k_tiles):
 
         k_j = tl.load(K_block_ptr, boundary_check = (0,1), padding_option="zero")
         v_j = tl.load(V_block_ptr, boundary_check = (0,1), padding_option="zero")
         #tl.device_print("k_j", k_j)
         s_ij = tl.dot(q, tl.trans(k_j)) * scale
+        if is_causal and j == query_tile_index:
+            #tl.device_print("j", j)
+            row_idx = tl.arange(0, Q_TILE_SIZE)
+            col_idx = tl.arange(0, K_TILE_SIZE)
+            causal_mask = row_idx[:, None] >= col_idx[None, :]
+            s_ij = tl.where(causal_mask, s_ij, float("-inf"))
+        
         m_j = tl.max(s_ij, axis=-1)
+        
         m_j = tl.maximum(m_curr, m_j)
         #tl.device_print("m_j-after", m_j)
         p_ij = tl.exp(s_ij - m_j[:, None])
