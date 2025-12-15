@@ -15,7 +15,7 @@ def flash_fwd_kernel(
     stride_lb, stride_lq,
     N_QUERIES, N_KEYS,
     scale,
-    is_causal,
+    is_causal: tl.constexpr,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
@@ -165,8 +165,8 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal: bool = False):
         print(f"this is {Q.shape=}, {K.shape=} and {V.shape=}")
-        print(f"PT Q[0,0,:5]: {Q[0, 0, :5]}")
-        print(f"PT K[0,0,:5]: {K[0, 0, :5]}")
+        ctx.is_causal = is_causal
+
         b, Nq, d = Q.shape
         b, Nk, d = K.shape
         d_fac = 1/math.sqrt(d)
@@ -185,14 +185,14 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
         K_b = torch.split(K, 1, dim=0)
         V_b = torch.split(V, 1, dim=0)
 
-        for batch in range(1):
+        for batch in range(b):
             # tiling Q, K and V matrices
             Q_tiled = torch.split(Q_b[batch], split_size_or_sections=Bq, dim=1)  # torch split splits by "split size"!
             K_tiled = torch.split(K_b[batch], Bk, dim=1)
             V_tiled = torch.split(V_b[batch], Bk, dim=1)
 
             # implementing flash attention algo
-            for i in range(1): #Tq
+            for i in range(Tq): #Tq
 
                 q_i = Q_tiled[i].squeeze(0)
                 # print(f"{q_i.shape = }")
@@ -200,7 +200,7 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
                 l_i = torch.zeros((Bq,))
                 o_i = torch.zeros((Bq, d))
                 # print(f"{o_i.shape = }")
-                for j in range(1): #Tk
+                for j in range(Tk): #Tk
                     k_j = K_tiled[j].squeeze(0)
                     v_j = V_tiled[j].squeeze(0)
 
