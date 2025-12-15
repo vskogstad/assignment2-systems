@@ -15,9 +15,11 @@ def flash_fwd_kernel(
     stride_lb, stride_lq,
     N_QUERIES, N_KEYS,
     scale,
+    is_causal,
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -64,7 +66,7 @@ def flash_fwd_kernel(
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_lb,
         shape = (N_QUERIES,),
-        strides = (stride_lq),
+        strides = (stride_lq,),
         offsets = (query_tile_index*Q_TILE_SIZE,),
         block_shape = (Q_TILE_SIZE,),
         order = (0,),
@@ -74,78 +76,42 @@ def flash_fwd_kernel(
     #O_local = tl.zeros((Q_TILE_SIZE, D)) 
     #L_local = tl.zeros((Q_TILE_SIZE,))
 
-    m_curr = tl.ones((Q_TILE_SIZE,), dtype=tl.float32) * float("-inf")
-    l_j = tl.ones((Q_TILE_SIZE,), dtype=tl.float32)
-    o_j = tl.ones((Q_TILE_SIZE, D), dtype=tl.float32)
+    m_curr = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32) 
+    l_j = tl.full((Q_TILE_SIZE,), 1, dtype=tl.float32)
+    o_j = tl.full((Q_TILE_SIZE, D), 1, dtype=tl.float32)
     q = tl.load(Q_block_ptr, boundary_check = (0,1), padding_option="zero")
 
-    for j in range(N_KEYS):
+    for j in range(N_KEYS//K_TILE_SIZE):
 
         k_j = tl.load(K_block_ptr, boundary_check = (0,1), padding_option="zero")
         v_j = tl.load(V_block_ptr, boundary_check = (0,1), padding_option="zero")
-        
-        s_ij = tl.dot(q, tl.transpose(k_j)) * scale
+        #tl.device_print("k_j", k_j)
+        s_ij = tl.dot(q, tl.trans(k_j)) * scale
         m_j = tl.max(s_ij, axis=-1)
         m_j = tl.maximum(m_curr, m_j)
-        
-        p_ij = tl.exp(s_ij - tl.reshape(m_j, 1, Q_TILE_SIZE))
+        #tl.device_print("m_j-after", m_j)
+        p_ij = tl.exp(s_ij - m_j[:, None])
         # running_numerator (this is NOT a normalized complete P_ij tile)  Bq x Bk
 
         l_j = tl.exp(m_curr - m_j) * l_j + tl.sum(p_ij, axis=-1)
         #print(f"-----{torch.exp(m_i - m_j) = } \n----{torch.exp(m_i - m_j).shape = } ")
         # running_denominator: add current sum, scale previous sum by e(m_{j-i} - m_{j})
         #
-        o_j = tl.exp(m_curr - m_j)[:, None] * o_j + tl.dot(p_ij, v_j)
+        o_j = tl.exp(m_curr - m_j)[:, None] * o_j + tl.dot(p_ij.to(v_j.dtype), v_j)
         #print(f"{l_i = } -- {o_i = }")
         # running output. diag() as we here have a matrix of values we need to rescale instead of a scalar for l_i
         # Bq, Bq @ Bq, d -> Bq, d
         m_curr = m_j # update m j-1
         # advance k, v - pointers
-        K_block_ptr.advance((0, K_TILE_SIZE))
-        V_block_ptr.advance((0, K_TILE_SIZE))
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     
     o_j = (1 / l_j)[:, None] * o_j
-    l_j = m_j + tl.log(l_j)
+    l_j = m_curr + tl.log(l_j)
     
-    tl.store(O_block_ptr, o_j)
+    tl.store(O_block_ptr, o_j.to(tl.float32))
     tl.store(L_block_ptr, l_j)
-    """for i in range(Tq): #Tq
-
-                q_i = Q_tiled[i].squeeze(0)
-                # print(f"{q_i.shape = }")
-                m_i = torch.ones((Bq,)) * float("-inf")
-                l_i = torch.zeros((Bq,))
-                o_i = torch.zeros((Bq, d))
-                # print(f"{o_i.shape = }")
-                for j in range(Tk): #Tk
-                    k_j = K_tiled[j].squeeze(0)
-                    v_j = V_tiled[j].squeeze(0)
-
-                    # running softmax
-                    s_ij = einsum(q_i, k_j, "Bq d, Bk d -> Bq Bk") * d_fac  # compute pre-softmax attention
-                    m_j = torch.max(s_ij, dim=-1).values  # max_value in each row of current tile
-                    #print(f"{m_j = } -- {s_ij[:,-1] = }")
-                    m_j = torch.max(m_i, m_j)  # update max-values for each row.
-                    #print(f"{s_ij = } -- {m_j = }")
-                    p_ij = torch.exp(s_ij - m_j.unsqueeze(1))
-                    #print(f"{p_ij == torch.exp(s_ij - m_j)} ")
-                    # running_numerator (this is NOT a normalized complete P_ij tile)  Bq x Bk
-                    l_i = torch.exp(m_i - m_j) * l_i + torch.sum(p_ij, dim=-1)
-                    #print(f"-----{torch.exp(m_i - m_j) = } \n----{torch.exp(m_i - m_j).shape = } ")
-                    # running_denominator: add current sum, scale previous sum by e(m_{j-i} - m_{j})
-                    o_i = torch.diag(torch.exp(m_i - m_j)) @ o_i + p_ij @ v_j
-                    #print(f"{l_i = } -- {o_i = }")
-                    # running output. diag() as we here have a matrix of values we need to rescale instead of a scalar for l_i
-                    # Bq, Bq @ Bq, d -> Bq, d
-                    m_i = m_j # update m j-1
-                O_i = torch.diag(1 / l_i) @ o_i
-                L_i = m_j + torch.log(l_i)  # TODO: Need to understand wtf this is.
-                # write to out
-                O_global[batch, i * Bq : (i + 1) * Bq, :] = O_i
-                L_global[batch, i * Bq : (i + 1) * Bq] = L_i
-
-        ctx.save_for_backward(L_global, O_global)
-        return O_global"""
+    
 
 class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
 
@@ -169,7 +135,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         K_TILE_SIZE = 16
         Tq = N_QUERIES // Q_TILE_SIZE
 
-        grid = (b, Tq) # launch independent batches and Q-tiles across SM's
+        grid = (Tq, b) # launch independent batches and Q-tiles across SM's
         flash_fwd_kernel[grid](
             Q_ptr, K_ptr, V_ptr,
             O_ptr, L_ptr,
@@ -180,9 +146,11 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
             stride_lb, stride_lq,
             N_QUERIES, N_KEYS,
             scale,
+            is_causal,
             D,
             Q_TILE_SIZE,
             K_TILE_SIZE,)
+
         ctx.save_for_backward(L_ptr, O_ptr)
         return O_ptr
 
@@ -197,6 +165,8 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal: bool = False):
         print(f"this is {Q.shape=}, {K.shape=} and {V.shape=}")
+        print(f"PT Q[0,0,:5]: {Q[0, 0, :5]}")
+        print(f"PT K[0,0,:5]: {K[0, 0, :5]}")
         b, Nq, d = Q.shape
         b, Nk, d = K.shape
         d_fac = 1/math.sqrt(d)
@@ -215,14 +185,14 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
         K_b = torch.split(K, 1, dim=0)
         V_b = torch.split(V, 1, dim=0)
 
-        for batch in range(b):
+        for batch in range(1):
             # tiling Q, K and V matrices
             Q_tiled = torch.split(Q_b[batch], split_size_or_sections=Bq, dim=1)  # torch split splits by "split size"!
             K_tiled = torch.split(K_b[batch], Bk, dim=1)
             V_tiled = torch.split(V_b[batch], Bk, dim=1)
 
             # implementing flash attention algo
-            for i in range(Tq): #Tq
+            for i in range(1): #Tq
 
                 q_i = Q_tiled[i].squeeze(0)
                 # print(f"{q_i.shape = }")
@@ -230,7 +200,7 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
                 l_i = torch.zeros((Bq,))
                 o_i = torch.zeros((Bq, d))
                 # print(f"{o_i.shape = }")
-                for j in range(Tk): #Tk
+                for j in range(1): #Tk
                     k_j = K_tiled[j].squeeze(0)
                     v_j = V_tiled[j].squeeze(0)
 
@@ -258,6 +228,8 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
                 L_global[batch, i * Bq : (i + 1) * Bq] = L_i
 
         ctx.save_for_backward(L_global, O_global)
+
+
         return O_global
 
 
