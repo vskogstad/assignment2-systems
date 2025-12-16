@@ -231,20 +231,108 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
                     # Bq, Bq @ Bq, d -> Bq, d
                     m_i = m_j # update m j-1
                 O_i = torch.diag(1 / l_i) @ o_i
+                #print(p_ij)
                 L_i = m_j + torch.log(l_i)  # TODO: Need to understand wtf this is.
                 # write to out
                 O_global[batch, i * Bq : (i + 1) * Bq, :] = O_i
                 L_global[batch, i * Bq : (i + 1) * Bq] = L_i
 
-        ctx.save_for_backward(L_global, O_global)
+        ctx.save_for_backward(Q, K, V, L_global, O_global)
 
 
         return O_global
 
 
     @staticmethod
-    def backward(ctx, grad_out):
-        return NotImplementedError
+    def backward(ctx, dO):
+        Q, K, V, L, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
+
+        b, Nq, d = Q.shape
+        b, Nk, d = K.shape
+        d_fac = 1/math.sqrt(d)
+
+        Bq = 16
+        Bk = 16
+
+        Tq = Nq // Bq
+        Tk = Nk // Bk
+
+        dQ = torch.zeros_like(Q)  # b, Nq, d
+        dK = torch.zeros_like(K)  # b, Nk, d
+        dV = torch.zeros_like(V)  # b, Nk, d
+
+        # calculating each batch independently
+        Q_b = torch.split(Q, split_size_or_sections=1, dim=0)
+        K_b = torch.split(K, 1, dim=0)
+        V_b = torch.split(V, 1, dim=0)
+        L_b = torch.split(L, 1, dim=0)
+        O_b = torch.split(O, 1, dim=0)
+
+        for batch in range(b):
+            # tiling Q, K and V matrices
+            Q_tiled = torch.split(Q_b[batch], split_size_or_sections=Bq, dim=1)  # torch split splits by "split size"!
+            K_tiled = torch.split(K_b[batch], Bk, dim=1)
+            V_tiled = torch.split(V_b[batch], Bk, dim=1)
+            L_tiled = torch.split(L_b[batch], Bk, dim=1)
+            O_tiled = torch.split(O_b[batch], Bk, dim=1)
+            # implementing flash attention algo
+            for i in range(Tq): #Tq
+
+                q_i = Q_tiled[i].squeeze(0)
+                l_i = L_tiled[i].squeeze(0)
+                o_i = O_tiled[i].squeeze(0)
+                # print(f"{o_i.shape = }")
+                for j in range(Tk): #Tk
+                    k_j = K_tiled[j].squeeze(0)
+                    v_j = V_tiled[j].squeeze(0)
+
+                    # running softmax
+                    s_ij = einsum(q_i, k_j, "Bq d, Bk d -> Bq Bk") * d_fac  # compute pre-softmax attention
+                    print(f"{s_ij.shape = } -- {l_i.shape = }")
+                    p_ij = torch.exp(s_ij - L)
+                    
+
+                    #dV[batch, Tq*i:Tq*(i+1), Tk*j:Tk*(j+1)] = torch.transpose(p_ij) @ dO
+                
+
+        dQ, dK = Q, K
+        
+        return  dQ, dK, dV, None
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 class AttentionAutogradFuncion(torch.autograd.Function):
@@ -271,7 +359,7 @@ class AttentionAutogradFuncion(torch.autograd.Function):
         return O
 
     @staticmethod
-    def backward(ctx, grad_out):
+    def backward(q, k, v, o, do):
         return NotImplementedError
 
 
