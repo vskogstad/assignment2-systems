@@ -268,6 +268,7 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
         V_b = torch.split(V, 1, dim=0)
         L_b = torch.split(L, 1, dim=0)
         O_b = torch.split(O, 1, dim=0)
+        dO_b = torch.split(dO, 1, dim=0)
 
         for batch in range(b):
             # tiling Q, K and V matrices
@@ -275,13 +276,15 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
             K_tiled = torch.split(K_b[batch], Bk, dim=1)
             V_tiled = torch.split(V_b[batch], Bk, dim=1)
             L_tiled = torch.split(L_b[batch], Bk, dim=1)
-            O_tiled = torch.split(O_b[batch], Bk, dim=1)
+            O_tiled = torch.split(O_b[batch], Bq, dim=1)
+            dO_tiled = torch.split(dO_b[batch], Bq, dim=1)
             # implementing flash attention algo
             for i in range(Tq): #Tq
 
                 q_i = Q_tiled[i].squeeze(0)
                 l_i = L_tiled[i].squeeze(0)
                 o_i = O_tiled[i].squeeze(0)
+                do_i = dO_tiled[i].squeeze(0)
                 # print(f"{o_i.shape = }")
                 for j in range(Tk): #Tk
                     k_j = K_tiled[j].squeeze(0)
@@ -289,11 +292,12 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
 
                     # running softmax
                     s_ij = einsum(q_i, k_j, "Bq d, Bk d -> Bq Bk") * d_fac  # compute pre-softmax attention
-                    print(f"{s_ij.shape = } -- {l_i.shape = }")
-                    p_ij = torch.exp(s_ij - L)
+                    print(f"{s_ij.shape = } -- {l_i.shape = } -- {do_i.shape = }, {d = }")
+                    p_ij = torch.exp(s_ij - l_i[:, None])
                     
 
-                    #dV[batch, Tq*i:Tq*(i+1), Tk*j:Tk*(j+1)] = torch.transpose(p_ij) @ dO
+                    dV[batch, Bk*j:Bk*(j+1), :] = torch.transpose(p_ij, 0, 1) @ dO_tiled[i]
+                    
                 
 
         dQ, dK = Q, K
