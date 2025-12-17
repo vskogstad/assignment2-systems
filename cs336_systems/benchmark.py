@@ -114,64 +114,7 @@ def benchmark_model(cfg: Config, memory_profile: bool, num_trials: int, warmup_s
     return results
 
 
-@torch.compile()
-# @dynamo.disable
-def scaled_dot_product_attention(Q, K, V, mask):
-    d_k = Q.shape[-1]
-    seq_len = Q.shape[-2]
-    # print(f"{Q.shape=}  {K.shape=} | {V.shape=}")
-    # Q^T K / sqrt(d_k)
-    attn = einsum(Q, K, "b ... sq d_k, b ... sk d_k -> b ... sq sk") / math.sqrt(d_k)
-    # apply mask if included
-    if mask is not None:
-        m = mask.to(bool)
-        attn = attn.masked_fill(~mask, float("-inf"))
-    result = einsum(softmax(x=attn, dimension=-1), V, "b ... sq sk, b ... sk d_v -> b ... sq d_v")
 
-    return result
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["seq_dim"],
-        x_vals=[128**i for i in range(2, 16)],
-        line_arg="attention_function",
-        line_vals=["Triton_torch_bw", "Tri-Dao", "Torch.compile"],
-        line_names=["Triton fw, torch bw", "nn.scaled_dot..", "torch.compile()"],
-        styles=[("blue", "-"), ("green", "-"), ("red", "-")],
-        ylabel="GB/s",
-        plot_name="Attention",  # name for the plot. Used also as a file name for saving the plot.
-        args={
-            "batch_dim": 1,
-            "head_dim": 64,
-            "dtype": torch.dtype.bfloat16,
-        },  # values for function arguments not in `x_names` and `y_name`
-    )
-)
-def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function):
-    """
-    Based on the benchmarking sample from triton-tutorials:
-    https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
-    """
-    from cs336_basics.model import scaled_dot_product_attention as torch_compile_attn
-    from torch.nn.Functonal import scaled_dot_product_attention as tri_dao_attn
-
-    Q = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
-    K = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
-    V = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
-
-    mask = None
-    if attention_function == "Triton_torch_bw":
-        ms = triton.testing.do_bench(lambda: torch_compile_attn(Q, K, V, mask))
-    if attention_function == "Tri-Dao":
-        ms = triton.testing.do_bench(lambda: tri_dao_attn(Q, K, V, mask))
-    if attention_function == "Torch.compile":
-        ms = triton.testing.do_bench(lambda: torch_compile_attn(Q, K, V, mask))
-    GBperSec = lambda ms: 2 * (Q.numel() + K.numel() + V.numel()) * Q.element_size() * 1e-9 / (ms * 1e-3)
-    return GBperSec(ms)
-
-
-benchmark_attention.run(show_plots=True, print_data=True)
 
 if __name__ == "__main__":
     # Parse command line arguments

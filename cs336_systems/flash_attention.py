@@ -250,7 +250,7 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
 
         b, Nq, d = Q.shape
         b, Nk, d = K.shape
-        d_fac = 1/math.sqrt(d)
+        scale = 1/math.sqrt(d)
 
         Bq = 16
         Bk = 16
@@ -262,6 +262,10 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
         dK = torch.zeros_like(K)  # b, Nk, d
         dV = torch.zeros_like(V)  # b, Nk, d
 
+        # Precomputing D
+        D = torch.sum(dO * O, dim=-1)
+
+
         # calculating each batch independently
         Q_b = torch.split(Q, split_size_or_sections=1, dim=0)
         K_b = torch.split(K, 1, dim=0)
@@ -269,6 +273,11 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
         L_b = torch.split(L, 1, dim=0)
         O_b = torch.split(O, 1, dim=0)
         dO_b = torch.split(dO, 1, dim=0)
+        D_b = torch.split(D, 1, dim=0)
+
+        
+
+
 
         for batch in range(b):
             # tiling Q, K and V matrices
@@ -278,35 +287,109 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
             L_tiled = torch.split(L_b[batch], Bk, dim=1)
             O_tiled = torch.split(O_b[batch], Bq, dim=1)
             dO_tiled = torch.split(dO_b[batch], Bq, dim=1)
+            D_tiled = torch.split(D_b[batch], Bq, dim=1)
+
             # implementing flash attention algo
-            for i in range(Tq): #Tq
-
-                q_i = Q_tiled[i].squeeze(0)
-                l_i = L_tiled[i].squeeze(0)
-                o_i = O_tiled[i].squeeze(0)
-                do_i = dO_tiled[i].squeeze(0)
-                # print(f"{o_i.shape = }")
-                for j in range(Tk): #Tk
-                    k_j = K_tiled[j].squeeze(0)
-                    v_j = V_tiled[j].squeeze(0)
-
-                    # running softmax
-                    s_ij = einsum(q_i, k_j, "Bq d, Bk d -> Bq Bk") * d_fac  # compute pre-softmax attention
-                    print(f"{s_ij.shape = } -- {l_i.shape = } -- {do_i.shape = }, {d = }")
-                    p_ij = torch.exp(s_ij - l_i[:, None])
-                    
-
-                    dV[batch, Bk*j:Bk*(j+1), :] = torch.transpose(p_ij, 0, 1) @ dO_tiled[i]
-                    
+            for j in range(Tk): #Tk
+                K_j = K_tiled[j].squeeze(0)
+                V_j = V_tiled[j].squeeze(0)
+                dK_j = torch.zeros_like(K_j)
+                dV_j = torch.zeros_like(V_j)
                 
+                
+                for i in range(Tq): #Tq
 
-        dQ, dK = Q, K
+                    Q_i = Q_tiled[i].squeeze(0)
+                    L_i = L_tiled[i].squeeze(0)
+                    O_i = O_tiled[i].squeeze(0)
+                    dO_i = dO_tiled[i].squeeze(0)
+                    D_i = D_tiled[i].squeeze(0)
+
+                    
+                    S_ij = einsum(Q_i, K_j, "Bq d, Bk d -> Bq Bk") * scale  # compute pre-softmax attention
+                    P_ij = torch.exp(S_ij - L_i[:, None]) # Don't need running softmax as we have stored L
+
+                    dV_j += P_ij.T @ dO_i
+                    dP_ij = dO_i @ V_j.T
+                    dS_ij = P_ij * (dP_ij - D_i[:, None]) * scale
+                    dQ[batch, Bq*i:Bq*(i+1), :] += dS_ij @ K_j  # Must be atomic add in triton kernel for correctness.
+                    dK_j += dS_ij.T @ Q_i
+                    
+                dK[batch, Bk*j:Bk*(j+1), :] = dK_j
+                dV[batch, Bk*j:Bk*(j+1), :] = dV_j
+                
         
         return  dQ, dK, dV, None
 
 
 
+@torch.compile()
+# @dynamo.disable
+def scaled_dot_product_attention(Q, K, V, mask):
+    d_k = Q.shape[-1]
+    seq_len = Q.shape[-2]
+    # print(f"{Q.shape=}  {K.shape=} | {V.shape=}")
+    # Q^T K / sqrt(d_k)
+    attn = einsum(Q, K, "b ... sq d_k, b ... sk d_k -> b ... sq sk") / math.sqrt(d_k)
+    # apply mask if included
+    if mask is not None:
+        m = mask.to(bool)
+        attn = attn.masked_fill(~mask, float("-inf"))
+    result = einsum(softmax(x=attn, dimension=-1), V, "b ... sq sk, b ... sk d_v -> b ... sq d_v")
 
+    return result
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["seq_dim"],
+        x_vals=[2**i for i in range(7, 7)], #16
+        line_arg="attention_function",
+        line_vals=["Triton_torch_bw", "Tri-Dao", "Torch.compile"],
+        line_names=["Triton fw, torch bw", "nn.scaled_dot..", "torch.compile()"],
+        styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+        ylabel="GB/s",
+        plot_name="Attention",  # name for the plot. Used also as a file name for saving the plot.
+        args={
+            "batch_dim": 1,
+            "head_dim": 64,
+            "dtype": torch.bfloat16,
+        },  # values for function arguments not in `x_names` and `y_name`
+    )
+)
+
+
+def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function):
+    """
+    Based on the benchmarking sample from triton-tutorials:
+    https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
+    """
+    from cs336_basics.model import scaled_dot_product_attention as torch_compile_attn
+    from torch.nn.Functonal import scaled_dot_product_attention as tri_dao_attn
+
+    DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+    Q = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
+    K = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
+    V = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
+    
+    mask = None
+    
+    stream = getattr(torch, DEVICE.type).Stream()
+    getattr(torch, DEVICE.type).set_stream(stream)
+
+    if attention_function == "Triton_torch_bw":
+        ms = triton.testing.do_bench(lambda: torch_compile_attn(Q, K, V, mask))
+    if attention_function == "Tri-Dao":
+        ms = triton.testing.do_bench(lambda: tri_dao_attn(Q, K, V, mask))
+    if attention_function == "Torch.compile":
+        ms = triton.testing.do_bench(lambda: torch_compile_attn(Q, K, V, mask))
+    GBperSec = lambda ms: 2 * (Q.numel() + K.numel() + V.numel()) * Q.element_size() * 1e-9 / (ms * 1e-3)
+    return GBperSec(ms)
+
+
+if __name__ == "__main__":
+    benchmark_attention.run(show_plots=True, print_data=True)
 
 
 
