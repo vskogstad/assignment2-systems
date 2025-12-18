@@ -2,6 +2,7 @@ import math
 import triton
 import triton.language as tl
 import torch
+
 from einops import einsum, rearrange, reduce
 
 @triton.jit
@@ -21,6 +22,8 @@ def flash_fwd_kernel(
     K_TILE_SIZE: tl.constexpr,
     
 ):
+
+
     # Program indices
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
@@ -72,9 +75,6 @@ def flash_fwd_kernel(
         order = (0,),
     )
     
-    # TODO: Implement the flash attention algorithm 
-    #O_local = tl.zeros((Q_TILE_SIZE, D)) 
-    #L_local = tl.zeros((Q_TILE_SIZE,))
 
     m_curr = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32) 
     l_j = tl.full((Q_TILE_SIZE,), 1, dtype=tl.float32)
@@ -96,21 +96,13 @@ def flash_fwd_kernel(
             s_ij = tl.where(causal_mask, s_ij, float("-inf"))
         
         m_j = tl.max(s_ij, axis=-1)
-        
-        m_j = tl.maximum(m_curr, m_j)
-        #tl.device_print("m_j-after", m_j)
-        p_ij = tl.exp(s_ij - m_j[:, None])
-        # running_numerator (this is NOT a normalized complete P_ij tile)  Bq x Bk
-
+        m_j = tl.maximum(m_curr, m_j)  # find max values for all tiles up to and including j
+        p_ij = tl.exp(s_ij - m_j[:, None]) # running_numerator (this is NOT a normalized complete P_ij tile)  Bq x Bk
         l_j = tl.exp(m_curr - m_j) * l_j + tl.sum(p_ij, axis=-1)
-        #print(f"-----{torch.exp(m_i - m_j) = } \n----{torch.exp(m_i - m_j).shape = } ")
         # running_denominator: add current sum, scale previous sum by e(m_{j-i} - m_{j})
-        #
-        o_j = tl.exp(m_curr - m_j)[:, None] * o_j + tl.dot(p_ij.to(v_j.dtype), v_j)
-        #print(f"{l_i = } -- {o_i = }")
-        # running output. diag() as we here have a matrix of values we need to rescale instead of a scalar for l_i
-        # Bq, Bq @ Bq, d -> Bq, d
+        o_j = tl.exp(m_curr - m_j)[:, None] * o_j + tl.dot(p_ij.to(v_j.dtype), v_j)  # running output. Bq, Bq @ Bq, d -> Bq, d
         m_curr = m_j # update m j-1
+        
         # advance k, v - pointers
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
@@ -129,6 +121,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         b, N_QUERIES, D = Q_ptr.shape
         b, N_KEYS, D = K_ptr.shape
         scale = 1 / math.sqrt(D)
+        ctx.is_causal = is_causal
         O_ptr = torch.empty((Q_ptr.shape), device=Q_ptr.device)
         L_ptr = torch.empty((b, N_QUERIES), device=Q_ptr.device)
         
@@ -140,8 +133,8 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         stride_lb, stride_lq            = (L_ptr.stride(0), L_ptr.stride(1))
         
 
-        Q_TILE_SIZE = 16
-        K_TILE_SIZE = 16
+        Q_TILE_SIZE = 64
+        K_TILE_SIZE = 64
         Tq = N_QUERIES // Q_TILE_SIZE
 
         grid = (Tq, b) # launch independent batches and Q-tiles across SM's
@@ -160,12 +153,86 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
             Q_TILE_SIZE,
             K_TILE_SIZE,)
 
-        ctx.save_for_backward(L_ptr, O_ptr)
+        ctx.save_for_backward(Q_ptr, K_ptr, V_ptr, L_ptr, O_ptr)
         return O_ptr
 
     @staticmethod
-    def backward(ctx, grad_out):
-        return NotImplementedError
+    def backward(ctx, dO):
+        Q, K, V, L, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
+
+        b, Nq, d = Q.shape
+        b, Nk, d = K.shape
+        scale = 1/math.sqrt(d)
+
+        Bq = 16
+        Bk = 16
+
+        Tq = Nq // Bq
+        Tk = Nk // Bk
+
+        dQ = torch.zeros_like(Q)  # b, Nq, d
+        dK = torch.zeros_like(K)  # b, Nk, d
+        dV = torch.zeros_like(V)  # b, Nk, d
+
+        # Precomputing D
+        D = torch.sum(dO * O, dim=-1)
+
+
+        # calculating each batch independently
+        Q_b = torch.split(Q, split_size_or_sections=1, dim=0)
+        K_b = torch.split(K, 1, dim=0)
+        V_b = torch.split(V, 1, dim=0)
+        L_b = torch.split(L, 1, dim=0)
+        O_b = torch.split(O, 1, dim=0)
+        dO_b = torch.split(dO, 1, dim=0)
+        D_b = torch.split(D, 1, dim=0)
+
+        
+
+
+
+        for batch in range(b):
+            # tiling Q, K and V matrices
+            Q_tiled = torch.split(Q_b[batch], split_size_or_sections=Bq, dim=1)  # torch split splits by "split size"!
+            K_tiled = torch.split(K_b[batch], Bk, dim=1)
+            V_tiled = torch.split(V_b[batch], Bk, dim=1)
+            L_tiled = torch.split(L_b[batch], Bk, dim=1)
+            O_tiled = torch.split(O_b[batch], Bq, dim=1)
+            dO_tiled = torch.split(dO_b[batch], Bq, dim=1)
+            D_tiled = torch.split(D_b[batch], Bq, dim=1)
+
+            # implementing flash attention algo
+            for j in range(Tk): #Tk
+                K_j = K_tiled[j].squeeze(0)
+                V_j = V_tiled[j].squeeze(0)
+                dK_j = torch.zeros_like(K_j)
+                dV_j = torch.zeros_like(V_j)
+                
+                
+                for i in range(Tq): #Tq
+
+                    Q_i = Q_tiled[i].squeeze(0)
+                    L_i = L_tiled[i].squeeze(0)
+                    O_i = O_tiled[i].squeeze(0)
+                    dO_i = dO_tiled[i].squeeze(0)
+                    D_i = D_tiled[i].squeeze(0)
+
+                    
+                    S_ij = einsum(Q_i, K_j, "Bq d, Bk d -> Bq Bk") * scale  # compute pre-softmax attention
+                    P_ij = torch.exp(S_ij - L_i[:, None]) # Don't need running softmax as we have stored L
+
+                    dV_j += P_ij.T @ dO_i
+                    dP_ij = dO_i @ V_j.T
+                    dS_ij = P_ij * (dP_ij - D_i[:, None]) * scale
+                    dQ[batch, Bq*i:Bq*(i+1), :] += dS_ij @ K_j  # Must be atomic add in triton kernel for correctness.
+                    dK_j += dS_ij.T @ Q_i
+                    
+                dK[batch, Bk*j:Bk*(j+1), :] = dK_j
+                dV[batch, Bk*j:Bk*(j+1), :] = dV_j
+                
+        
+        return  dQ, dK, dV, None
 
 
 class FlashAttentionAutogradFuncion(torch.autograd.Function):
@@ -343,15 +410,15 @@ def scaled_dot_product_attention(Q, K, V, mask):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["seq_dim"],
-        x_vals=[2**i for i in range(7, 7)], #16
+        x_vals=[2**i for i in range(7, 13)], #16
         line_arg="attention_function",
-        line_vals=["Triton_torch_bw", "Tri-Dao", "Torch.compile"],
+        line_vals=["Triton_torch_bw", "FA_torch", "Torch.compile"],
         line_names=["Triton fw, torch bw", "nn.scaled_dot..", "torch.compile()"],
         styles=[("blue", "-"), ("green", "-"), ("red", "-")],
         ylabel="GB/s",
         plot_name="Attention",  # name for the plot. Used also as a file name for saving the plot.
         args={
-            "batch_dim": 1,
+            "batch_dim": 128,
             "head_dim": 64,
             "dtype": torch.bfloat16,
         },  # values for function arguments not in `x_names` and `y_name`
@@ -364,14 +431,15 @@ def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function)
     Based on the benchmarking sample from triton-tutorials:
     https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
     """
-    from cs336_basics.model import scaled_dot_product_attention as torch_compile_attn
-    from torch.nn.Functonal import scaled_dot_product_attention as tri_dao_attn
+    from cs336_basics.model import scaled_dot_product_attention as compiled_sdpa
+    from torch.nn.functional import scaled_dot_product_attention as nn_sdpa
 
-    DEVICE = triton.runtime.driver.active.get_active_torch_device()
+    #DEVICE = triton.runtime.driver.active.get_active_torch_device()
+    DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    Q = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype)
+    K = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype)
+    V = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype)
 
-    Q = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
-    K = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
-    V = torch.randn(batch_dim, seq_dim, head_dim, dtype=dtype)
     
     mask = None
     
@@ -379,45 +447,26 @@ def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function)
     getattr(torch, DEVICE.type).set_stream(stream)
 
     if attention_function == "Triton_torch_bw":
-        ms = triton.testing.do_bench(lambda: torch_compile_attn(Q, K, V, mask))
-    if attention_function == "Tri-Dao":
-        ms = triton.testing.do_bench(lambda: tri_dao_attn(Q, K, V, mask))
+        ms = triton.testing.do_bench(lambda: TritonFlashAttentionAutogradFunction.apply(Q, K, V))
+    if attention_function == "FA_torch":
+        Q = Q.unsqueeze(1)  # Add head dimension: (batch, 1, seq, d)
+        K = K.unsqueeze(1)
+        V = V.unsqueeze(1)
+        ms = triton.testing.do_bench(lambda: nn_sdpa(Q, K, V)); 
     if attention_function == "Torch.compile":
-        ms = triton.testing.do_bench(lambda: torch_compile_attn(Q, K, V, mask))
-    GBperSec = lambda ms: 2 * (Q.numel() + K.numel() + V.numel()) * Q.element_size() * 1e-9 / (ms * 1e-3)
-    return GBperSec(ms)
+        Q = Q.squeeze(1)  # Add head dimension: (batch, 1, seq, d)
+        K = K.squeeze(1)
+        V = V.squeeze(1)
+        ms = triton.testing.do_bench(lambda: compiled_sdpa(Q, K, V, mask))
+    
+    #GBperSec = lambda ms: 2 * (Q.numel() + K.numel() + V.numel()) * Q.element_size() * 1e-9 / (ms * 1e-3)
+    tflops = 4 * batch_dim * seq_dim * seq_dim * head_dim * 1e-12 / (ms * 1e-3) 
+    
+    return tflops
 
 
 if __name__ == "__main__":
     benchmark_attention.run(show_plots=True, print_data=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
