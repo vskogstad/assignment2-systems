@@ -110,9 +110,86 @@ def flash_fwd_kernel(
     o_j = (1 / l_j)[:, None] * o_j
     l_j = m_curr + tl.log(l_j)
     
-    tl.store(O_block_ptr, o_j.to(tl.float32))
-    tl.store(L_block_ptr, l_j)
+    tl.store(O_block_ptr, o_j.to(O_block_ptr.type.element_ty))
+    tl.store(L_block_ptr, l_j.to(L_block_ptr.type.element_ty))
     
+@torch.compile()
+def flash_bwd_pytorch(Q, K, V, L, O, dO, is_causal):
+    b, Nq, d = Q.shape
+    scale = 1 / math.sqrt(d)
+    
+    D = torch.sum(dO * O, dim=-1)
+
+    
+    return dQ, dK, dV
+    
+def flash_bwd_pytorch_tiled(Q, K, V, L, O, dO, is_causal):
+    b, Nq, d = Q.shape
+    b, Nk, d = K.shape
+    scale = 1/math.sqrt(d)
+
+    Bq = 16
+    Bk = 16
+
+    Tq = Nq // Bq
+    Tk = Nk // Bk
+
+    dQ = torch.zeros_like(Q)  # b, Nq, d
+    dK = torch.zeros_like(K)  # b, Nk, d
+    dV = torch.zeros_like(V)  # b, Nk, d
+
+    # Precomputing D
+    D = torch.sum(dO * O, dim=-1)
+
+    # calculating each batch independently
+    Q_b = torch.split(Q, split_size_or_sections=1, dim=0)
+    K_b = torch.split(K, 1, dim=0)
+    V_b = torch.split(V, 1, dim=0)
+    L_b = torch.split(L, 1, dim=0)
+    O_b = torch.split(O, 1, dim=0)
+    dO_b = torch.split(dO, 1, dim=0)
+    D_b = torch.split(D, 1, dim=0)
+
+    for batch in range(b):
+        # tiling Q, K and V matrices
+        Q_tiled = torch.split(Q_b[batch], split_size_or_sections=Bq, dim=1)  # torch split splits by "split size"!
+        K_tiled = torch.split(K_b[batch], Bk, dim=1)
+        V_tiled = torch.split(V_b[batch], Bk, dim=1)
+        L_tiled = torch.split(L_b[batch], Bk, dim=1)
+        O_tiled = torch.split(O_b[batch], Bq, dim=1)
+        dO_tiled = torch.split(dO_b[batch], Bq, dim=1)
+        D_tiled = torch.split(D_b[batch], Bq, dim=1)
+
+        # implementing flash attention algo
+        for j in range(Tk): #Tk
+            K_j = K_tiled[j].squeeze(0)
+            V_j = V_tiled[j].squeeze(0)
+            dK_j = torch.zeros_like(K_j)
+            dV_j = torch.zeros_like(V_j)
+            
+            
+            for i in range(Tq): #Tq
+
+                Q_i = Q_tiled[i].squeeze(0)
+                L_i = L_tiled[i].squeeze(0)
+                O_i = O_tiled[i].squeeze(0)
+                dO_i = dO_tiled[i].squeeze(0)
+                D_i = D_tiled[i].squeeze(0)
+
+                
+                S_ij = einsum(Q_i, K_j, "Bq d, Bk d -> Bq Bk") * scale  # compute pre-softmax attention
+                P_ij = torch.exp(S_ij - L_i[:, None]) # Don't need running softmax as we have stored L
+
+                dV_j += P_ij.T @ dO_i
+                dP_ij = dO_i @ V_j.T
+                dS_ij = P_ij * (dP_ij - D_i[:, None]) * scale
+                dQ[batch, Bq*i:Bq*(i+1), :] += dS_ij @ K_j  # Must be atomic add in triton kernel for correctness.
+                dK_j += dS_ij.T @ Q_i
+                
+            dK[batch, Bk*j:Bk*(j+1), :] = dK_j
+            dV[batch, Bk*j:Bk*(j+1), :] = dV_j
+
+    return dQ, dK, dV
 
 class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
 
@@ -122,8 +199,8 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         b, N_KEYS, D = K_ptr.shape
         scale = 1 / math.sqrt(D)
         ctx.is_causal = is_causal
-        O_ptr = torch.empty((Q_ptr.shape), device=Q_ptr.device)
-        L_ptr = torch.empty((b, N_QUERIES), device=Q_ptr.device)
+        O_ptr = torch.empty((Q_ptr.shape), device=Q_ptr.device, dtype=Q_ptr.dtype)
+        L_ptr = torch.empty((b, N_QUERIES), device=Q_ptr.device, dtype=Q_ptr.dtype)
         
         #BLOCK_SIZE = 1024
         stride_qb, stride_qq, stride_qd = (Q_ptr.stride(0), Q_ptr.stride(1), Q_ptr.stride(2))
@@ -160,79 +237,11 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
     def backward(ctx, dO):
         Q, K, V, L, O = ctx.saved_tensors
         is_causal = ctx.is_causal
-
-        b, Nq, d = Q.shape
-        b, Nk, d = K.shape
-        scale = 1/math.sqrt(d)
-
-        Bq = 16
-        Bk = 16
-
-        Tq = Nq // Bq
-        Tk = Nk // Bk
-
-        dQ = torch.zeros_like(Q)  # b, Nq, d
-        dK = torch.zeros_like(K)  # b, Nk, d
-        dV = torch.zeros_like(V)  # b, Nk, d
-
-        # Precomputing D
-        D = torch.sum(dO * O, dim=-1)
-
-
-        # calculating each batch independently
-        Q_b = torch.split(Q, split_size_or_sections=1, dim=0)
-        K_b = torch.split(K, 1, dim=0)
-        V_b = torch.split(V, 1, dim=0)
-        L_b = torch.split(L, 1, dim=0)
-        O_b = torch.split(O, 1, dim=0)
-        dO_b = torch.split(dO, 1, dim=0)
-        D_b = torch.split(D, 1, dim=0)
-
-        
-
-
-
-        for batch in range(b):
-            # tiling Q, K and V matrices
-            Q_tiled = torch.split(Q_b[batch], split_size_or_sections=Bq, dim=1)  # torch split splits by "split size"!
-            K_tiled = torch.split(K_b[batch], Bk, dim=1)
-            V_tiled = torch.split(V_b[batch], Bk, dim=1)
-            L_tiled = torch.split(L_b[batch], Bk, dim=1)
-            O_tiled = torch.split(O_b[batch], Bq, dim=1)
-            dO_tiled = torch.split(dO_b[batch], Bq, dim=1)
-            D_tiled = torch.split(D_b[batch], Bq, dim=1)
-
-            # implementing flash attention algo
-            for j in range(Tk): #Tk
-                K_j = K_tiled[j].squeeze(0)
-                V_j = V_tiled[j].squeeze(0)
-                dK_j = torch.zeros_like(K_j)
-                dV_j = torch.zeros_like(V_j)
-                
-                
-                for i in range(Tq): #Tq
-
-                    Q_i = Q_tiled[i].squeeze(0)
-                    L_i = L_tiled[i].squeeze(0)
-                    O_i = O_tiled[i].squeeze(0)
-                    dO_i = dO_tiled[i].squeeze(0)
-                    D_i = D_tiled[i].squeeze(0)
-
-                    
-                    S_ij = einsum(Q_i, K_j, "Bq d, Bk d -> Bq Bk") * scale  # compute pre-softmax attention
-                    P_ij = torch.exp(S_ij - L_i[:, None]) # Don't need running softmax as we have stored L
-
-                    dV_j += P_ij.T @ dO_i
-                    dP_ij = dO_i @ V_j.T
-                    dS_ij = P_ij * (dP_ij - D_i[:, None]) * scale
-                    dQ[batch, Bq*i:Bq*(i+1), :] += dS_ij @ K_j  # Must be atomic add in triton kernel for correctness.
-                    dK_j += dS_ij.T @ Q_i
-                    
-                dK[batch, Bk*j:Bk*(j+1), :] = dK_j
-                dV[batch, Bk*j:Bk*(j+1), :] = dV_j
-                
+        dQ, dK, dV = flash_bwd_pytorch(Q, K, V, L, O, dO, is_causal)            
         
         return  dQ, dK, dV, None
+
+
 
 
 class FlashAttentionAutogradFuncion(torch.autograd.Function):
@@ -342,10 +351,6 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
         dO_b = torch.split(dO, 1, dim=0)
         D_b = torch.split(D, 1, dim=0)
 
-        
-
-
-
         for batch in range(b):
             # tiling Q, K and V matrices
             Q_tiled = torch.split(Q_b[batch], split_size_or_sections=Bq, dim=1)  # torch split splits by "split size"!
@@ -440,7 +445,7 @@ def scaled_dot_product_attention(Q, K, V, mask):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["seq_dim"],
-        x_vals=[2**i for i in range(7, 13)], #16
+        x_vals=[2**i for i in range(7, 12)], #16
         line_arg="attention_function",
         line_vals=["Triton_torch_bw", "FA_torch", "Torch.compile"],
         line_names=["Triton fw, torch bw", "nn.scaled_dot..", "torch.compile()"],
@@ -448,11 +453,11 @@ def scaled_dot_product_attention(Q, K, V, mask):
         ylabel="GB/s",
         plot_name="Attention",  # name for the plot. Used also as a file name for saving the plot.
         args={
-            "batch_dim": 128,
+            "batch_dim": 128*16,
             "head_dim": 64,
             "dtype": torch.bfloat16,
             "is_causal": True,
-            "direction": "backward",
+            "direction": "both",
         },  # values for function arguments not in `x_names` and `y_name`
     )
 )
@@ -492,8 +497,14 @@ def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function,
     
     #GBperSec = lambda ms: 2 * (Q.numel() + K.numel() + V.numel()) * Q.element_size() * 1e-9 / (ms * 1e-3)
     causal_scale = 1 / (1 + is_causal)
+    if direction == "both":
+        direction_scale = 3
+    elif direction == "backward":
+        direction_scale = 2
+    else: 
+        direction_scale = 1
     #print(causal_scale)
-    tflops = dtype.itemsize * batch_dim * seq_dim * seq_dim * head_dim * causal_scale * 1e-12 / (ms * 1e-3) 
+    tflops = dtype.itemsize * batch_dim * seq_dim * seq_dim * head_dim * causal_scale * direction_scale * 1e-12 / (ms * 1e-3) 
     
     return tflops
 
@@ -502,11 +513,10 @@ def test_wrapper(func, direction, Q, K, V):
         ms_fwd = triton.testing.do_bench(func)
         return ms_fwd
     elif direction == "backward":
-        # Backward only
-        out = func()
-        dO = torch.randn_like(out)
-        ms_bwd = triton.testing.do_bench(lambda: out.backward(dO, retain_graph=True))
-        return ms_bwd
+        dO = torch.randn(Q.shape, device=Q.device, dtype=Q.dtype)
+        ms_fwd = triton.testing.do_bench(func)
+        ms_fwd_bwd = triton.testing.do_bench(lambda: func().backward(dO))
+        return ms_fwd_bwd - ms_fwd  #Estimate backward time
     elif direction == "both":
         # Forward + backward
         dO = torch.randn(Q.shape, device=Q.device, dtype=Q.dtype)
