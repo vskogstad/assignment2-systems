@@ -390,6 +390,36 @@ class FlashAttentionAutogradFuncion(torch.autograd.Function):
 
 
 
+class AttentionAutogradFuncion(torch.autograd.Function):
+    """Basic implementation to get the logic right"""
+
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal: bool = False):
+        b, s, d = Q.shape
+        print(f"this is {Q.shape=}, {K.shape=} and {V.shape=}")
+        print(torch.max(torch.tensor(((1, 2, 3), (4, 5, 6)))))
+        S = einsum(Q, K, "b sq d, b sk d -> b sq sk") / math.sqrt(d)
+        print(f"{S.shape = }")
+        s_max = torch.max(S, dim=2, keepdim=True).values
+        print(f"{s_max.shape = }")
+        numerator = torch.exp(S - s_max)
+        denominator = torch.sum(numerator, dim=2, keepdim=True)
+        print(f"{numerator.shape = } -- {denominator.shape = }")
+        P = numerator / denominator
+        print(f"{P.shape = }")
+        O = einsum(P, V, "b sq sk, b sk d -> b sq d")
+        L = torch.log(reduce(torch.exp(S), "b sq sk -> b sq", "sum"))
+        print(f"{O.shape = } -- {L.shape = }")
+        ctx.save_for_backward(L, O)
+        return O
+
+    @staticmethod
+    def backward(q, k, v, o, do):
+        return NotImplementedError
+
+
+
+
 @torch.compile()
 # @dynamo.disable
 def scaled_dot_product_attention(Q, K, V, mask):
@@ -421,12 +451,12 @@ def scaled_dot_product_attention(Q, K, V, mask):
             "batch_dim": 128,
             "head_dim": 64,
             "dtype": torch.bfloat16,
+            "is_causal": True,
+            "direction": "backward",
         },  # values for function arguments not in `x_names` and `y_name`
     )
 )
-
-
-def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function):
+def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function, is_causal, direction):
     """
     Based on the benchmarking sample from triton-tutorials:
     https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
@@ -434,68 +464,64 @@ def benchmark_attention(batch_dim, seq_dim, head_dim, dtype, attention_function)
     from cs336_basics.model import scaled_dot_product_attention as compiled_sdpa
     from torch.nn.functional import scaled_dot_product_attention as nn_sdpa
 
-    #DEVICE = triton.runtime.driver.active.get_active_torch_device()
     DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    Q = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype)
-    K = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype)
-    V = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype)
+
+    Q = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype, requires_grad=True)
+    K = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype, requires_grad=True)
+    V = torch.randn(batch_dim, seq_dim, head_dim, device=DEVICE, dtype=dtype, requires_grad=True)
 
     
-    mask = None
+    #mask = torch.tril(torch.ones((seq_dim, seq_dim), device=DEVICE, dtype=dtype))
     
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
 
     if attention_function == "Triton_torch_bw":
-        ms = triton.testing.do_bench(lambda: TritonFlashAttentionAutogradFunction.apply(Q, K, V))
+        #ms = triton.testing.do_bench(lambda: TritonFlashAttentionAutogradFunction.apply(Q, K, V, is_causal))
+        ms = test_wrapper(lambda: TritonFlashAttentionAutogradFunction.apply(Q, K, V, is_causal), direction, Q, K, V)
     if attention_function == "FA_torch":
         Q = Q.unsqueeze(1)  # Add head dimension: (batch, 1, seq, d)
         K = K.unsqueeze(1)
         V = V.unsqueeze(1)
-        ms = triton.testing.do_bench(lambda: nn_sdpa(Q, K, V)); 
-    if attention_function == "Torch.compile":
-        Q = Q.squeeze(1)  # Add head dimension: (batch, 1, seq, d)
+        ms = test_wrapper(lambda: nn_sdpa(Q, K, V, is_causal=is_causal), direction, Q, K, V)
+        Q = Q.squeeze(1)  # Remove head dimension: (batch, seq, d)
         K = K.squeeze(1)
         V = V.squeeze(1)
-        ms = triton.testing.do_bench(lambda: compiled_sdpa(Q, K, V, mask))
+    if attention_function == "Torch.compile":
+        ms = test_wrapper(lambda: compiled_sdpa(Q, K, V, mask=None), direction, Q, K, V)
     
     #GBperSec = lambda ms: 2 * (Q.numel() + K.numel() + V.numel()) * Q.element_size() * 1e-9 / (ms * 1e-3)
-    tflops = 4 * batch_dim * seq_dim * seq_dim * head_dim * 1e-12 / (ms * 1e-3) 
+    causal_scale = 1 / (1 + is_causal)
+    #print(causal_scale)
+    tflops = dtype.itemsize * batch_dim * seq_dim * seq_dim * head_dim * causal_scale * 1e-12 / (ms * 1e-3) 
     
     return tflops
 
+def test_wrapper(func, direction, Q, K, V):
+    if direction == "forward":
+        ms_fwd = triton.testing.do_bench(func)
+        return ms_fwd
+    elif direction == "backward":
+        # Backward only
+        out = func()
+        dO = torch.randn_like(out)
+        ms_bwd = triton.testing.do_bench(lambda: out.backward(dO, retain_graph=True))
+        return ms_bwd
+    elif direction == "both":
+        # Forward + backward
+        dO = torch.randn(Q.shape, device=Q.device, dtype=Q.dtype)
+        def fwd_bwd():
+            Q.grad, K.grad, V.grad = None, None, None
+            out = func()
+            out.backward(dO)
+        ms_both = triton.testing.do_bench(fwd_bwd)
+        return ms_both
+    else:
+        raise NotImplementedError('Function can only be run with direction = "forward", "backward" or "both".')
 
 if __name__ == "__main__":
     benchmark_attention.run(show_plots=True, print_data=True)
 
 
-
-
-class AttentionAutogradFuncion(torch.autograd.Function):
-    """Basic implementation to get the logic right"""
-
-    @staticmethod
-    def forward(ctx, Q, K, V, is_causal: bool = False):
-        b, s, d = Q.shape
-        print(f"this is {Q.shape=}, {K.shape=} and {V.shape=}")
-        print(torch.max(torch.tensor(((1, 2, 3), (4, 5, 6)))))
-        S = einsum(Q, K, "b sq d, b sk d -> b sq sk") / math.sqrt(d)
-        print(f"{S.shape = }")
-        s_max = torch.max(S, dim=2, keepdim=True).values
-        print(f"{s_max.shape = }")
-        numerator = torch.exp(S - s_max)
-        denominator = torch.sum(numerator, dim=2, keepdim=True)
-        print(f"{numerator.shape = } -- {denominator.shape = }")
-        P = numerator / denominator
-        print(f"{P.shape = }")
-        O = einsum(P, V, "b sq sk, b sk d -> b sq d")
-        L = torch.log(reduce(torch.exp(S), "b sq sk -> b sq", "sum"))
-        print(f"{O.shape = } -- {L.shape = }")
-        ctx.save_for_backward(L, O)
-        return O
-
-    @staticmethod
-    def backward(q, k, v, o, do):
-        return NotImplementedError
 
 
