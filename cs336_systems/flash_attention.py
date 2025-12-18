@@ -120,7 +120,19 @@ def flash_bwd_pytorch(Q, K, V, L, O, dO, is_causal):
     
     D = torch.sum(dO * O, dim=-1)
 
-    
+    S = einsum(Q, K, "b Bq d, b Bk d -> b Bq Bk") * scale
+    if is_causal:
+        mask = torch.triu(torch.ones(Nq,Nq, device = Q.device, dtype = torch.bool), diagonal=1)
+        S=S.masked_fill(mask, float("-inf"))
+
+    P = torch.exp(S - L.unsqueeze(-1)) # Don't need running softmax as we have stored L
+
+    dV = P.transpose(-2, -1) @ dO
+    dP = dO@ V.transpose(-2, -1)
+    dS = P * (dP - D.unsqueeze(-1)) * scale
+    dQ = dS @ K  # Must be atomic add in triton kernel for correctness.
+    dK = dS.transpose(-2, -1) @ Q
+
     return dQ, dK, dV
     
 def flash_bwd_pytorch_tiled(Q, K, V, L, O, dO, is_causal):
@@ -529,9 +541,28 @@ def test_wrapper(func, direction, Q, K, V):
     else:
         raise NotImplementedError('Function can only be run with direction = "forward", "backward" or "both".')
 
-if __name__ == "__main__":
-    benchmark_attention.run(show_plots=True, print_data=True)
 
+def test_timing_flash_forward_backward():
+    n_heads = 16
+    d_head = 64
+    sequence_length = 16384
+    q, k, v = torch.randn(3, n_heads, sequence_length, d_head, device='cuda', dtype=torch.bfloat16, requires_grad=True
+    )
+
+    flash = torch.compile(TritonFlashAttentionAutogradFunction.apply)
+
+    def flash_forward_backward():
+        o = flash(q, k, v, True)
+        loss = o.sum()
+        loss.backward()
+
+    results = triton.testing.do_bench(flash_forward_backward, rep=1000, warmup=100) #rep=10000, warmup=1000)
+    print(results)
+
+if __name__ == "__main__":
+    #benchmark_attention.run(show_plots=True, print_data=True)
+    
+    test_timing_flash_forward_backward()
 
 
 
