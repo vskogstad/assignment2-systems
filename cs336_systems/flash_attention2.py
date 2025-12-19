@@ -307,26 +307,48 @@ def flash_bwd_kernel(
 
         for i in range(Tq):  # Tq
             Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            L_i = tl.load(L_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            L_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
             #O_i = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
             dO_i = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            D_i = tl.load(D_block_ptr, boundary_check=(0, 1), padding_option="zero")
+            D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")
 
             S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # compute pre-softmax attention
             P_ij = tl.exp(S_ij - L_i[:, None])  # Don't need running softmax as we have stored L
 
             dV_j += tl.dot(tl.trans(P_ij), dO_i)
-            dP_ij = tl.dot(dO_i @ tl.trans(V_j))
+            dP_ij = tl.dot(dO_i, tl.trans(V_j))
             dS_ij = P_ij * (dP_ij - D_i[:, None]) * scale
-            tl.atomic_add(dQ_block_ptr, dS_ij @ K_j) # Must be atomic add in triton kernel for correctness.
+            # Triton doesn' accept block pointers in atomic add. Booo!
+            dQ_tile = tl.dot(dS_ij, K_j).to(dQ_block_ptr.type.element_ty)
+            q_range = tl.arange(0, Q_TILE_SIZE)
+            d_range = tl.arange(0, d)
+            q_offs = (query_tile_index * Q_TILE_SIZE + q_range)[:, None]
+            d_offs = d_range[None, :]
+            #Compute flat offsets into dQ
+            dQ_ptrs = dQ_ptr + batch_index * stride_dqb + q_offs * stride_dqq + d_offs * stride_dqd
+            # Create mask for bounds checking
+            mask = (q_offs < N_QUERIES) & (d_offs < d)
+            tl.atomic_add(dQ_ptrs, dQ_tile, mask=mask)
             dK_j += tl.dot(tl.trans(dS_ij), Q_i)
 
-
-
+            # advance Q, L, dO and D pointers
+            Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+            L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+            dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+            D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
+        # advance k, v - pointers
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+        
         #dK[batch, Bk * j : Bk * (j + 1), :] = dK_j
         #dV[batch, Bk * j : Bk * (j + 1), :] = dV_j
         tl.store(dK_block_ptr, dK_j.to(dK_block_ptr.type.element_ty))
         tl.store(dV_block_ptr, dV_j.to(dV_block_ptr.type.element_ty))
+
+        Q_block_ptr = Q_block_ptr.advance((-Tq * Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((-Tq * Q_TILE_SIZE,))
+        dO_block_ptr = dO_block_ptr.advance((-Tq * Q_TILE_SIZE, 0))
+        D_block_ptr = D_block_ptr.advance((-Tq * Q_TILE_SIZE,))
 
 
 

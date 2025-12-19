@@ -4,7 +4,7 @@ from typing import Type
 
 import torch
 
-from cs336_systems.flash_attention import FlashAttentionAutogradFuncion, TritonFlashAttentionAutogradFunction
+from cs336_systems.flash_attention2 import FlashAttentionAutogradFuncion, TritonFlashAttentionAutogradFunction
 
 
 def get_flashattention_autograd_function_pytorch() -> Type:
