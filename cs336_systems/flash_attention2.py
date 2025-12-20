@@ -301,6 +301,10 @@ def flash_bwd_kernel(
     if is_causal:
         initial_tile = key_tile_index 
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE*initial_tile, 0))
+        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE*initial_tile,))
+        dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE*initial_tile, 0))
+        D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE*initial_tile,))
+
     else: 
         initial_tile = 0
 
@@ -308,8 +312,8 @@ def flash_bwd_kernel(
     #for j in range(Tk):  # Tk
     K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
     V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    dK_j = tl.zeros_like(K_j)
-    dV_j = tl.zeros_like(V_j)
+    dK_j = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
+    dV_j = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
     
     
     for i in range(initial_tile, Tq):  # 
@@ -328,12 +332,12 @@ def flash_bwd_kernel(
        
         P_ij = tl.exp(S_ij - L_i[:, None])  # Don't need running softmax as we have stored L
 
-        dV_j += tl.dot(tl.trans(P_ij), dO_i)
+        dV_j += tl.dot(tl.trans(P_ij.to(dO_i.dtype)), dO_i)
         dP_ij = tl.dot(dO_i, tl.trans(V_j))
         dS_ij = P_ij * (dP_ij - D_i[:, None]) * scale
         
         # Triton doesn' accept block pointers in atomic add. Booo!
-        dQ_tile = tl.dot(dS_ij, K_j).to(dQ_block_ptr.type.element_ty)
+        dQ_tile = tl.dot(dS_ij.to(K_j.dtype), K_j) #.to(dQ_block_ptr.type.element_ty)
         q_range = tl.arange(0, Q_TILE_SIZE)
         d_range = tl.arange(0, d)
         q_offs = (i * Q_TILE_SIZE + q_range)[:, None]
@@ -342,9 +346,9 @@ def flash_bwd_kernel(
         dQ_ptrs = dQ_ptr + batch_index * stride_dqb + q_offs * stride_dqq + d_offs * stride_dqd
         # Create mask for bounds checking
         mask = (q_offs < N_QUERIES) & (d_offs < d)
-        tl.atomic_add(dQ_ptrs, dQ_tile, mask=mask)
+        tl.atomic_add(dQ_ptrs, dQ_tile.to(dQ_block_ptr.type.element_ty), mask=mask)
         
-        dK_j += tl.dot(tl.trans(dS_ij), Q_i)
+        dK_j += tl.dot(tl.trans(dS_ij).to(Q_i.dtype), Q_i)
 
         # advance Q, L, dO and D pointers
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
@@ -428,7 +432,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         # dQ, dK, dV = flash_bwd_pytorch(Q, K, V, L, O, dO, is_causal)
 
         # BLOCK_SIZE = 1024
-        dQ_ptr = torch.zeros((Q_ptr.shape), device=O_ptr.device, dtype=O_ptr.dtype)
+        dQ_ptr = torch.zeros((Q_ptr.shape), device=Q_ptr.device, dtype=torch.float32)
         dK_ptr = torch.empty((K_ptr.shape), device=K_ptr.device, dtype=K_ptr.dtype)
         dV_ptr = torch.empty((V_ptr.shape), device=V_ptr.device, dtype=V_ptr.dtype)
 
