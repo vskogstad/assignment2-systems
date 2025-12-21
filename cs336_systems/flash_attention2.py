@@ -11,11 +11,11 @@ from einops import einsum, rearrange, reduce
             {"Q_TILE_SIZE": Q_TILE_SIZE, "K_TILE_SIZE":K_TILE_SIZE},
             num_warps=num_warps,
         )
-        for Q_TILE_SIZE in [16, 32]
-        for K_TILE_SIZE in [64, 128]
-        for num_warps in [2, 4, 8]
+        for Q_TILE_SIZE in [32, 64]
+        for K_TILE_SIZE in [32, 64]
+        for num_warps in [2, 4]
     ],
-    key = ["N_QUERIES", "N_KEYS", "d"]
+    key = ["N_QUERIES", "N_KEYS", "D"]
 )"""
 @triton.jit
 def flash_fwd_kernel(
@@ -97,21 +97,36 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
+
+
     m_curr = tl.full((Q_TILE_SIZE,), float("-inf"), dtype=tl.float32)
     l_j = tl.full((Q_TILE_SIZE,), 1, dtype=tl.float32)
     o_j = tl.full((Q_TILE_SIZE, D), 1, dtype=tl.float32)
     q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    num_k_tiles = query_tile_index + 1 if is_causal else N_KEYS // K_TILE_SIZE
+    last_query_pos = (query_tile_index + 1) * Q_TILE_SIZE - 1
+    num_k_tiles = last_query_pos // K_TILE_SIZE + 1 if is_causal else N_KEYS // K_TILE_SIZE
+
+
+    if is_causal:
+        start_diag_tile = query_tile_index * Q_TILE_SIZE // K_TILE_SIZE
+
+    else: 
+        initial_tile = 0
+
+    
+    row_idx = tl.arange(0, Q_TILE_SIZE) + query_tile_index * Q_TILE_SIZE
+    K_base = tl.arange(0, K_TILE_SIZE)
+    # Diagonals in separate loop:
+
 
     for j in range(num_k_tiles):
         k_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
         v_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
         # tl.device_print("k_j", k_j)
         s_ij = tl.dot(q, tl.trans(k_j)) * scale
-        if is_causal and j == query_tile_index:
+        if is_causal and j >= start_diag_tile:
             # tl.device_print("j", j)
-            row_idx = tl.arange(0, Q_TILE_SIZE)
-            col_idx = tl.arange(0, K_TILE_SIZE)
+            col_idx = K_base + j * K_TILE_SIZE
             causal_mask = row_idx[:, None] >= col_idx[None, :]
             s_ij = tl.where(causal_mask, s_ij, float("-inf"))
 
@@ -418,6 +433,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         Tq = N_QUERIES // Q_TILE_SIZE
 
         grid = (Tq, b)  # launch independent batches and Q-tiles across SM's
+        #grid = lambda META: (N_QUERIES // META['Q_TILE_SIZE'], b)
         flash_fwd_kernel[grid](
             Q_ptr,
             K_ptr,
@@ -445,7 +461,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
             D,
             Q_TILE_SIZE,
             K_TILE_SIZE,
-
+            
         )
 
         ctx.save_for_backward(Q_ptr, K_ptr, V_ptr, L_ptr, O_ptr)
@@ -824,7 +840,7 @@ def test_timing_flash_forward_backward():
     sequence_length = 16384
     q, k, v = torch.randn(3, n_heads, sequence_length, d_head, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-    flash = torch.compile(TritonFlashAttentionAutogradFunction.apply)
+    flash = TritonFlashAttentionAutogradFunction.apply
 
     def flash_forward_backward():
         o = flash(q, k, v, True)
@@ -839,4 +855,7 @@ if __name__ == "__main__":
     #benchmark_attention.run(show_plots=True, print_data=True)
 
     test_timing_flash_forward_backward()
-    print(flash_bwd_kernel.best_config)
+    print(dir(flash_fwd_kernel))
+    print(flash_fwd_kernel.cache)
+    print(flash_fwd_kernel.best_config)
+    print(dir(flash_fwd_kernel))
