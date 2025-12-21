@@ -399,7 +399,18 @@ def flash_bwd_kv(
     tl.store(dK_block_ptr, dK_j.to(dK_block_ptr.type.element_ty))
     tl.store(dV_block_ptr, dV_j.to(dV_block_ptr.type.element_ty))
 
-
+"""@triton.autotune(
+    configs = [
+        triton.Config(
+            {"Q_TILE_SIZE": Q_TILE_SIZE, "K_TILE_SIZE":K_TILE_SIZE},
+            num_warps=num_warps,
+        )
+        for Q_TILE_SIZE in [64, 128, 256]
+        for K_TILE_SIZE in [16, 32, 64]
+        for num_warps in [2, 4, 8]
+    ],
+    key = ["N_QUERIES", "N_KEYS", "d"]
+)"""
 @triton.jit
 def flash_bwd_dq(
     Q_ptr,
@@ -564,7 +575,7 @@ def flash_bwd_dq(
         P_ij = tl.exp(S_ij - L[:, None])  # Don't need running softmax as we have stored L
         dP_ij = tl.dot(dO, tl.trans(V_j))
         dS_ij = P_ij * (dP_ij - D_i[:, None]) * scale
-        
+
         dQ_acc += tl.dot(dS_ij.to(K_j.dtype), K_j)
 
         # advance k- pointer
@@ -664,7 +675,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         Q_TILE_SIZE_dq = 64
         K_TILE_SIZE_dq = 64
         Tq = N_QUERIES // Q_TILE_SIZE_dq
-        #grid = lambda META: (N_KEYS // META['K_TILE_SIZE'], b)  
+        #grid = lambda META: (N_QUERIES // META['Q_TILE_SIZE'], b)  
         grid = (Tq, b) # launch independent batches and Q-tiles across SM's
         flash_bwd_dq[grid](
             Q_ptr,
@@ -1075,6 +1086,7 @@ def test_timing_flash_forward_backward():
 
 
 if __name__ == "__main__":
-    benchmark_attention.run(show_plots=True, print_data=True)
+    #benchmark_attention.run(show_plots=True, print_data=True)
 
     test_timing_flash_forward_backward()
+    print(flash_bwd_dq.best_config)
