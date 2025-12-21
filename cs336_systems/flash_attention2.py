@@ -459,8 +459,8 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
             scale,
             is_causal,
             D,
-            Q_TILE_SIZE,
-            K_TILE_SIZE,
+            Q_TILE_SIZE, # comment out if autotuning.
+            K_TILE_SIZE, # comment out if autotuning.
             
         )
 
@@ -476,12 +476,12 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         scale = 1 / math.sqrt(d)
         # dQ, dK, dV = flash_bwd_pytorch(Q, K, V, L, O, dO, is_causal)
 
-        # BLOCK_SIZE = 1024
         dQ_ptr = torch.zeros((Q_ptr.shape), device=Q_ptr.device, dtype=torch.float32)
         dK_ptr = torch.empty((K_ptr.shape), device=K_ptr.device, dtype=K_ptr.dtype)
         dV_ptr = torch.empty((V_ptr.shape), device=V_ptr.device, dtype=V_ptr.dtype)
 
         # Precomputing D
+        #D_ptr = torch.empty((L_ptr.shape), device=L_ptr.device, dtype=L_ptr.dtype)
         D_ptr = torch.sum(dO_ptr * O_ptr, dim=-1)
 
         stride_qb, stride_qq, stride_qd = (Q_ptr.stride(0), Q_ptr.stride(1), Q_ptr.stride(2))
@@ -499,8 +499,8 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         K_TILE_SIZE = 128
         Tk = N_KEYS // K_TILE_SIZE
 
-        #grid = lambda META: (N_KEYS // META['K_TILE_SIZE'], b)  # launch independent batches and Q-tiles across SM's
-        grid = (Tk, b)
+        #grid = lambda META: (N_KEYS // META['K_TILE_SIZE'], b)  
+        grid = (Tk, b) # launch independent batches and Q-tiles across SM's
         flash_bwd_kernel[grid](
             Q_ptr,
             K_ptr,
@@ -545,8 +545,8 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
             scale,
             is_causal,
             d,
-            Q_TILE_SIZE,
-            K_TILE_SIZE,
+            Q_TILE_SIZE, # comment out if autotuning.
+            K_TILE_SIZE, # comment out if autotuning.
 
         )
 
@@ -840,7 +840,7 @@ def test_timing_flash_forward_backward():
     sequence_length = 16384
     q, k, v = torch.randn(3, n_heads, sequence_length, d_head, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
-    flash = TritonFlashAttentionAutogradFunction.apply
+    flash = torch.compile(TritonFlashAttentionAutogradFunction.apply)
 
     def flash_forward_backward():
         o = flash(q, k, v, True)
@@ -852,10 +852,6 @@ def test_timing_flash_forward_backward():
 
 
 if __name__ == "__main__":
-    #benchmark_attention.run(show_plots=True, print_data=True)
+    benchmark_attention.run(show_plots=True, print_data=True)
 
     test_timing_flash_forward_backward()
-    print(dir(flash_fwd_kernel))
-    print(flash_fwd_kernel.cache)
-    print(flash_fwd_kernel.best_config)
-    print(dir(flash_fwd_kernel))
