@@ -299,7 +299,7 @@ def flash_bwd_kernel(
     Tq = N_QUERIES // Q_TILE_SIZE
 
     if is_causal:
-        initial_tile = key_tile_index 
+        initial_tile = key_tile_index * Q_TILE_SIZE // K_TILE_SIZE
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE*initial_tile, 0))
         L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE*initial_tile,))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE*initial_tile, 0))
@@ -323,7 +323,7 @@ def flash_bwd_kernel(
         dO_i = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
         D_i = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")
         S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # compute pre-softmax attention
-        if is_causal and i == key_tile_index:
+        if is_causal and i == initial_tile:
             #tl.device_print("j", j)
             row_idx = tl.arange(0, Q_TILE_SIZE)
             col_idx = tl.arange(0, K_TILE_SIZE)
@@ -450,8 +450,8 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         stride_lb, stride_lq = (L_ptr.stride(0), L_ptr.stride(1))
         stride_db, stride_dq = (D_ptr.stride(0), D_ptr.stride(1))
 
-        Q_TILE_SIZE = 64
-        K_TILE_SIZE = 64
+        Q_TILE_SIZE = 128
+        K_TILE_SIZE = 32
         Tk = N_KEYS // K_TILE_SIZE
 
         grid = (Tk, b)  # launch independent batches and Q-tiles across SM's
@@ -800,11 +800,11 @@ def test_timing_flash_forward_backward():
         loss = o.sum()
         loss.backward()
 
-    results = triton.testing.do_bench(flash_forward_backward, rep=1000, warmup=100)  # rep=10000, warmup=1000)
+    results = triton.testing.do_bench(flash_forward_backward, rep=10000, warmup=100)  # rep=10000, warmup=1000)
     print(results)
 
 
 if __name__ == "__main__":
-    # benchmark_attention.run(show_plots=True, print_data=True)
+    benchmark_attention.run(show_plots=True, print_data=True)
 
     test_timing_flash_forward_backward()
