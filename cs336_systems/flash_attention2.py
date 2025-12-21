@@ -5,7 +5,18 @@ import triton
 import triton.language as tl
 from einops import einsum, rearrange, reduce
 
-
+"""@triton.autotune(
+    configs = [
+        triton.Config(
+            {"Q_TILE_SIZE": Q_TILE_SIZE, "K_TILE_SIZE":K_TILE_SIZE},
+            num_warps=num_warps,
+        )
+        for Q_TILE_SIZE in [16, 32]
+        for K_TILE_SIZE in [64, 128]
+        for num_warps in [2, 4, 8]
+    ],
+    key = ["N_QUERIES", "N_KEYS", "d"]
+)"""
 @triton.jit
 def flash_fwd_kernel(
     Q_ptr,
@@ -147,7 +158,18 @@ def flash_bwd_pytorch(Q, K, V, L, O, dO, is_causal):
 
     return dQ, dK, dV
 
-
+"""@triton.autotune(
+    configs = [
+        triton.Config(
+            {"Q_TILE_SIZE": Q_TILE_SIZE, "K_TILE_SIZE":K_TILE_SIZE},
+            num_warps=num_warps,
+        )
+        for Q_TILE_SIZE in [16, 32]
+        for K_TILE_SIZE in [64, 128]
+        for num_warps in [2, 4, 8]
+    ],
+    key = ["N_QUERIES", "N_KEYS", "d"]
+)"""
 @triton.jit
 def flash_bwd_kernel(
     Q_ptr,
@@ -317,6 +339,12 @@ def flash_bwd_kernel(
     dV_j = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
     
     
+    col_idx = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
+    Q_base = tl.arange(0, Q_TILE_SIZE)
+    # Diagonals in separate loop:
+
+
+    # Loop over remaing tiles:
     for i in range(initial_tile, Tq):  # 
         Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
         L_i = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")
@@ -326,8 +354,7 @@ def flash_bwd_kernel(
         S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale  # compute pre-softmax attention
         if is_causal and i <= initial_tile + diag_tiles - 1:
             # Using absolute position instead of relative
-            row_idx = tl.arange(0, Q_TILE_SIZE) + i*Q_TILE_SIZE
-            col_idx = tl.arange(0, K_TILE_SIZE) + key_tile_index * K_TILE_SIZE
+            row_idx = Q_base + i*Q_TILE_SIZE
             causal_mask = row_idx[:, None] >= col_idx[None, :]
             S_ij = tl.where(causal_mask, S_ij, float("-inf"))
        
@@ -418,6 +445,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
             D,
             Q_TILE_SIZE,
             K_TILE_SIZE,
+
         )
 
         ctx.save_for_backward(Q_ptr, K_ptr, V_ptr, L_ptr, O_ptr)
@@ -451,11 +479,12 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         stride_lb, stride_lq = (L_ptr.stride(0), L_ptr.stride(1))
         stride_db, stride_dq = (D_ptr.stride(0), D_ptr.stride(1))
 
-        Q_TILE_SIZE = 64
-        K_TILE_SIZE = 64
+        Q_TILE_SIZE = 16
+        K_TILE_SIZE = 128
         Tk = N_KEYS // K_TILE_SIZE
 
-        grid = (Tk, b)  # launch independent batches and Q-tiles across SM's
+        #grid = lambda META: (N_KEYS // META['K_TILE_SIZE'], b)  # launch independent batches and Q-tiles across SM's
+        grid = (Tk, b)
         flash_bwd_kernel[grid](
             Q_ptr,
             K_ptr,
@@ -502,6 +531,7 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
             d,
             Q_TILE_SIZE,
             K_TILE_SIZE,
+
         )
 
         return dQ_ptr, dK_ptr, dV_ptr, None
@@ -806,6 +836,7 @@ def test_timing_flash_forward_backward():
 
 
 if __name__ == "__main__":
-    benchmark_attention.run(show_plots=True, print_data=True)
+    #benchmark_attention.run(show_plots=True, print_data=True)
 
     test_timing_flash_forward_backward()
+    print(flash_bwd_kernel.best_config)
