@@ -755,8 +755,8 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
 
         # KV-kernel ---------------------------
 
-        Q_TILE_SIZE = 32
-        K_TILE_SIZE = 128
+        Q_TILE_SIZE = 128
+        K_TILE_SIZE = 64
         Tk = N_KEYS // K_TILE_SIZE
 
         #grid = lambda META: (N_KEYS // META['K_TILE_SIZE'], b)  
@@ -1015,7 +1015,7 @@ def scaled_dot_product_attention(Q, K, V, mask):
             "head_dim": 64,
             "dtype": torch.bfloat16,
             "is_causal": True,
-            "direction": "backward",
+            "direction": "both",
         },  # values for function arguments not in `x_names` and `y_name`
     )
 )
@@ -1109,7 +1109,7 @@ def test_timing_flash_forward_backward():
 
 
 if __name__ == "__main__":
-    #benchmark_attention.run(show_plots=True, print_data=True)
+    benchmark_attention.run(show_plots=True, print_data=True)
 
     test_timing_flash_forward_backward()
     #print(flash_bwd_dq.best_config)
