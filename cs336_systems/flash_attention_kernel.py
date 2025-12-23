@@ -845,7 +845,117 @@ def test_timing_flash_forward_backward():
     print(results)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["seq_dim"],
+        x_vals=[2**i for i in range(7, 10)],  # 16
+        line_arg="attention_function",
+        line_vals=["Triton_kernel", "FA_torch", "Torch.compile"],
+        line_names=["Triton kernel", "nn.scaled_dot..", "torch.compile()"],
+        styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+        ylabel="GB/s",
+        plot_name="Attention",  # name for the plot. Used also as a file name for saving the plot.
+        args={
+            "batch_dim": 128,
+            "num_heads": 16,
+            "head_dim": 64,
+            "dtype": torch.bfloat16,
+            "is_causal": True,
+            "direction": "both",
+        },  # values for function arguments not in `x_names` and `y_name`
+    )
+)
+def benchmark_attention(batch_dim, num_heads, seq_dim, head_dim, dtype, attention_function, is_causal, direction):
+    """
+    Based on the benchmarking sample from triton-tutorials:
+    https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html
+    """
+    from cs336_basics.model import scaled_dot_product_attention as compiled_sdpa
+    from torch.nn.functional import scaled_dot_product_attention as nn_sdpa
+
+    DEVICE = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    Q = torch.randn(batch_dim, num_heads, seq_dim, head_dim, device=DEVICE, dtype=dtype, requires_grad=True)
+    K = torch.randn(batch_dim, num_heads, seq_dim, head_dim, device=DEVICE, dtype=dtype, requires_grad=True)
+    V = torch.randn(batch_dim, num_heads, seq_dim, head_dim, device=DEVICE, dtype=dtype, requires_grad=True)
+
+    # mask = torch.tril(torch.ones((seq_dim, seq_dim), device=DEVICE, dtype=dtype))
+
+    stream = getattr(torch, DEVICE.type).Stream()
+    getattr(torch, DEVICE.type).set_stream(stream)
+
+    if attention_function == "Triton_kernel":
+        #Flatten Q, K and V
+        b, h, s, d = Q.shape
+        Q_flat = Q.reshape(b * h, s, d)
+        K_flat = K.reshape(b * h, s, d)
+        V_flat = V.reshape(b * h, s, d)
+        ms = test_wrapper(lambda: TritonFlashAttentionAutogradFunction.apply(Q_flat, K_flat, V_flat, is_causal), direction, Q, K, V)
+    if attention_function == "FA_torch":
+        ms = test_wrapper(lambda: nn_sdpa(Q, K, V, is_causal=is_causal), direction, Q, K, V)
+    if attention_function == "Torch.compile":
+        ms = test_wrapper(lambda: compiled_sdpa(Q, K, V, mask=None), direction, Q, K, V)
+
+    # GBperSec = lambda ms: 2 * (Q.numel() + K.numel() + V.numel()) * Q.element_size() * 1e-9 / (ms * 1e-3)
+    causal_scale = 1 / (1 + is_causal)
+    if direction == "both":
+        direction_scale = 3
+    elif direction == "backward":
+        direction_scale = 2
+    else:
+        direction_scale = 1
+    tflops = (
+        dtype.itemsize * batch_dim * num_heads * seq_dim * seq_dim * head_dim * causal_scale * direction_scale * 1e-12 / (ms * 1e-3)
+    )
+
+    return tflops
+
+
+def test_wrapper(func, direction, Q, K, V):
+    if direction == "forward":
+        ms_fwd = triton.testing.do_bench(func)
+        return ms_fwd
+    elif direction == "backward":
+        dO = torch.randn(Q.shape, device=Q.device, dtype=Q.dtype)
+        ms_fwd = triton.testing.do_bench(func)
+        ms_fwd_bwd = triton.testing.do_bench(lambda: func().backward(dO))
+        return ms_fwd_bwd - ms_fwd  # Estimate backward time
+    elif direction == "both":
+        # Forward + backward
+        dO = torch.randn(Q.shape, device=Q.device, dtype=Q.dtype)
+
+        def fwd_bwd():
+            Q.grad, K.grad, V.grad = None, None, None
+            out = func()
+            b, h, s, d = Q.shape
+            out = out.reshape(b, h, s, d)
+            out.backward(dO)
+
+        ms_both = triton.testing.do_bench(fwd_bwd)
+        return ms_both
+    else:
+        raise NotImplementedError('Function can only be run with direction = "forward", "backward" or "both".')
+
+
+def test_timing_flash_forward_backward():
+    n_heads = 16*128
+    d_head = 64
+    sequence_length = 512
+    q, k, v = torch.randn(3, n_heads, sequence_length, d_head, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    flash = torch.compile(TritonFlashAttentionAutogradFunction.apply)
+
+    def flash_forward_backward():
+        o = flash(q, k, v, True)
+        loss = o.sum()
+        loss.backward()
+
+    results = triton.testing.do_bench(flash_forward_backward, rep=1000, warmup=100)  # rep=10000, warmup=1000)
+    print(results)
+
+
 if __name__ == "__main__":
+    benchmark_attention.run(show_plots=True, print_data=True)
 
     test_timing_flash_forward_backward() # 
-    print("should give 3.399 roughly")
+    print("should give 3.40 roughly")
