@@ -5,6 +5,66 @@ import triton
 import triton.language as tl
 from einops import einsum, rearrange, reduce
 
+
+@triton.jit
+def flash_precompute_d(
+    O_ptr,
+    dO_ptr,
+    D_ptr,
+    stride_ob,
+    stride_oq,
+    stride_od,
+    stride_dob,
+    stride_doq,
+    stride_dod,
+    stride_db,
+    stride_dq,
+    N_QUERIES: tl.constexpr,
+    D_BLOCK_SIZE: tl.constexpr,
+    d: tl.constexpr,
+
+):
+
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+
+
+
+
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, d),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index*D_BLOCK_SIZE, 0),
+        block_shape=(D_BLOCK_SIZE, d),
+        order=(1, 0),
+    )
+
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_index * stride_dob,
+        shape=(N_QUERIES, d),
+        strides=(stride_doq, stride_dod),
+        offsets=(query_tile_index*D_BLOCK_SIZE, 0),
+        block_shape=(D_BLOCK_SIZE, d),
+        order=(1, 0),
+    )
+
+
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + batch_index * stride_db,
+        shape=(N_QUERIES,),
+        strides=(stride_dq,),
+        offsets=(query_tile_index*D_BLOCK_SIZE,),
+        block_shape=(D_BLOCK_SIZE,),
+        order=(0,),
+    )
+
+
+    o = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    do = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    delta = tl.sum(o * do, axis=1).to(D_block_ptr.type.element_ty)
+    tl.store(D_block_ptr, delta)
+
 """@triton.autotune(
     configs = [
         triton.Config(
@@ -685,13 +745,14 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         scale = 1 / math.sqrt(d)
         # dQ, dK, dV = flash_bwd_pytorch(Q, K, V, L, O, dO, is_causal)
 
-        dQ_ptr = torch.zeros((Q_ptr.shape), device=Q_ptr.device, dtype=torch.float32)
+        dQ_ptr = torch.zeros((Q_ptr.shape), device=Q_ptr.device, dtype=Q_ptr.dtype)
         dK_ptr = torch.empty((K_ptr.shape), device=K_ptr.device, dtype=K_ptr.dtype)
         dV_ptr = torch.empty((V_ptr.shape), device=V_ptr.device, dtype=V_ptr.dtype)
 
         # Precomputing D
         #D_ptr = torch.empty((L_ptr.shape), device=L_ptr.device, dtype=L_ptr.dtype)
-        D_ptr = torch.sum(dO_ptr * O_ptr, dim=-1)
+        #D1_torch = torch.sum(dO_ptr * O_ptr, dim=-1)
+        D_ptr = torch.empty_like(L_ptr, memory_format=torch.preserve_format)
 
         stride_qb, stride_qq, stride_qd = (Q_ptr.stride(0), Q_ptr.stride(1), Q_ptr.stride(2))
         stride_dqb, stride_dqq, stride_dqd = (dQ_ptr.stride(0), dQ_ptr.stride(1), dQ_ptr.stride(2))
@@ -704,6 +765,30 @@ class TritonFlashAttentionAutogradFunction(torch.autograd.Function):
         stride_lb, stride_lq = (L_ptr.stride(0), L_ptr.stride(1))
         stride_db, stride_dq = (D_ptr.stride(0), D_ptr.stride(1))
 
+        # D-kernel
+        D_BLOCK_SIZE = 128
+        Td = N_QUERIES // D_BLOCK_SIZE
+        grid = (Td, b)
+        flash_precompute_d[grid](
+            O_ptr,
+            dO_ptr,
+            D_ptr,
+            stride_ob,
+            stride_oq,
+            stride_od,
+            stride_dob,
+            stride_doq,
+            stride_dod,
+            stride_db,
+            stride_dq,
+            N_QUERIES,
+            D_BLOCK_SIZE,
+            d,
+            num_stages=1,
+            num_warps=4
+
+        )
+        #torch.testing.assert_close(D1_torch, D_ptr, atol=1e-2, rtol=1e-2)
 
         # dQ-kernel --------
         Q_TILE_SIZE_dq = 64
